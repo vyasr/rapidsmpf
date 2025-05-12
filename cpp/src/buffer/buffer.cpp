@@ -61,7 +61,13 @@ Buffer::Buffer(
     : br{br},
       size{device_buffer ? device_buffer->size() : 0},
       storage_{std::move(device_buffer)},
-      event_{event ? event : std::make_shared<Event>(stream)} {
+      // Use the provided event if it exists, otherwise create a new event to track the
+      // async copy only if the buffer is not empty
+      event_{
+          event      ? event
+          : size > 0 ? std::make_shared<Event>(stream)
+                     : nullptr
+      } {
     RAPIDSMPF_EXPECTS(
         std::get<DeviceStorageT>(storage_) != nullptr, "the device buffer cannot be NULL"
     );
@@ -137,6 +143,133 @@ std::unique_ptr<Buffer> Buffer::copy(MemoryType target, rmm::cuda_stream_view st
         },
         storage_
     );
+}
+
+std::unique_ptr<Buffer> Buffer::copy_slice(
+    std::ptrdiff_t offset, std::ptrdiff_t length, rmm::cuda_stream_view stream
+) const {
+    RAPIDSMPF_EXPECTS(offset <= std::ptrdiff_t(size), "offset can't be more than size");
+    RAPIDSMPF_EXPECTS(
+        offset + length <= std::ptrdiff_t(size), "offset + length can't be more than size"
+    );
+    return std::visit(
+        overloaded{
+            [&](const HostStorageT& storage) {  // host -> host
+                auto host_buf = std::unique_ptr<Buffer>(new Buffer{
+                    std::make_unique<std::vector<uint8_t>>(
+                        storage->begin() + offset, storage->begin() + offset + length
+                    ),
+                    br
+                });
+                host_buf->override_event(event_);  // if there was an event, use it
+                return host_buf;
+            },
+            [&](DeviceStorageT const& storage) {  // device -> device
+                return std::unique_ptr<Buffer>(new Buffer{
+                    std::make_unique<rmm::device_buffer>(
+                        static_cast<cuda::std::byte*>(storage->data()) + offset,
+                        length,
+                        stream,
+                        br->device_mr()
+                    ),
+                    stream,
+                    br
+                });
+            }
+        },
+        storage_
+    );
+}
+
+std::unique_ptr<Buffer> Buffer::copy_slice(
+    MemoryType target,
+    std::ptrdiff_t offset,
+    std::ptrdiff_t length,
+    rmm::cuda_stream_view stream
+) const {
+    RAPIDSMPF_EXPECTS(offset <= std::ptrdiff_t(size), "offset can't be more than size");
+    RAPIDSMPF_EXPECTS(
+        offset + length <= std::ptrdiff_t(size), "offset + length can't be more than size"
+    );
+
+    if (mem_type() == target) {
+        return copy_slice(offset, length, stream);
+    }
+
+    // Implement the copy between each possible memory types (both directions).
+    return std::visit(
+        overloaded{
+            [&](const HostStorageT& storage) {  // host -> device
+                return std::unique_ptr<Buffer>(new Buffer{
+                    std::make_unique<rmm::device_buffer>(
+                        static_cast<uint8_t const*>(storage->data()) + offset,
+                        length,
+                        stream,
+                        br->device_mr()
+                    ),
+                    stream,
+                    br
+                });
+            },
+            [&](DeviceStorageT const& storage) {  // device -> host
+                {
+                    auto ret = std::make_unique<std::vector<uint8_t>>(length);
+                    RAPIDSMPF_CUDA_TRY_ALLOC(cudaMemcpyAsync(
+                        ret->data(),
+                        static_cast<cuda::std::byte const*>(storage->data()) + offset,
+                        size_t(length),
+                        cudaMemcpyDeviceToHost,
+                        stream
+                    ));
+                    auto host_buf =
+                        std::unique_ptr<Buffer>(new Buffer{std::move(ret), br});
+                    // Create a new event to track the async copy only if length > 0
+                    if (length > 0) {
+                        host_buf->override_event(std::make_shared<Event>(stream));
+                    }
+                    return host_buf;
+                }
+            }
+        },
+        storage_
+    );
+}
+
+std::ptrdiff_t Buffer::copy_to(
+    Buffer& dest, std::ptrdiff_t dest_offset, rmm::cuda_stream_view stream
+) const {
+    RAPIDSMPF_EXPECTS(
+        dest.size - size_t(dest_offset) >= size,
+        "destination buffer is too small",
+        std::invalid_argument
+    );
+
+    if (size == 0) {  // empty buffer, nothing to do
+        return 0;
+    }
+
+    cudaMemcpyKind kind;
+
+    // if both buffers are on the host, use memcpy, otherwise, use cudaMemcpyAsync
+    if (mem_type() == MemoryType::HOST && dest.mem_type() == MemoryType::HOST) {
+        std::memcpy(static_cast<uint8_t*>(dest.data()) + dest_offset, data(), size);
+        return std::ptrdiff_t(size);
+    } else if (mem_type() == MemoryType::HOST) {
+        kind = cudaMemcpyHostToDevice;
+    } else if (dest.mem_type() == MemoryType::HOST) {
+        kind = cudaMemcpyDeviceToHost;
+    } else {
+        kind = cudaMemcpyDeviceToDevice;
+    }
+
+    RAPIDSMPF_CUDA_TRY_ALLOC(cudaMemcpyAsync(
+        static_cast<cuda::std::byte*>(dest.data()) + dest_offset,
+        data(),
+        size,
+        kind,
+        stream
+    ));
+    return std::ptrdiff_t(size);
 }
 
 bool Buffer::is_ready() const {
