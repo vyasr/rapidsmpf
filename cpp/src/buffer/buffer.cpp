@@ -252,6 +252,11 @@ std::ptrdiff_t Buffer::copy_to(
 
     // if both buffers are on the host, use memcpy, otherwise, use cudaMemcpyAsync
     if (mem_type() == MemoryType::HOST && dest.mem_type() == MemoryType::HOST) {
+        // if the source buffer is not ready, return 0
+        if (!is_ready()) {
+            return 0;
+        }
+        // src buffer is ready, copy the data
         std::memcpy(static_cast<uint8_t*>(dest.data()) + dest_offset, data(), size);
         return std::ptrdiff_t(size);
     } else if (mem_type() == MemoryType::HOST) {

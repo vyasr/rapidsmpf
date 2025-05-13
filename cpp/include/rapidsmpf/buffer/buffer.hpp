@@ -25,7 +25,7 @@ class Event;
 /// @brief Enum representing the type of memory.
 enum class MemoryType : int {
     DEVICE = 0,  ///< Device memory
-    HOST  ///< Host memory
+    HOST = 1  ///< Host memory
 };
 
 /// @brief Array of all the different memory types.
@@ -201,6 +201,15 @@ class Buffer {
 
     /**
      * @brief Copy data from this buffer to a destination buffer with a given offset.
+     *
+     * Follows the following rules:
+     * +------+------+-----------------------------------+
+     * |  src | dest |                 op                |
+     * +------+------+-----------------------------------+
+     * | host | host | memcpy if src is ready else NO OP |
+     * +------+------+-----------------------------------+
+     * |   X  |   X  |   cudaMemcpyAsync (needs event)   |
+     * +------+------+-----------------------------------+
      *
      * @param dest Destination buffer.
      * @param dest_offset Offset of the destination buffer.
